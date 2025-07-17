@@ -1,0 +1,87 @@
+import torch
+import torch.nn as nn
+from PLC_Block import CLA
+
+
+class LKA(nn.Module):
+    def __init__(self, dim, kernel_size, dilated_rate=3):
+        super().__init__()
+        self.dw = nn.Conv2d(dim, dim, kernel_size, padding="same", groups=dim)
+        self.d_dw = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=7,
+            stride=1,
+            padding=3,
+            groups=dim,
+            dilation=dilated_rate,
+        )
+        self.pw = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, x):
+        u = x.clone()
+        attn = self.dw(x)
+        attn = self.d_dw(attn)
+        attn = self.pw(attn)
+        return u * attn
+
+
+class MultiScaleExtractor(nn.Module):
+    def __init__(self, dim=64):
+        super().__init__()
+
+        self.dim = dim // 4
+        self.LKA1 = LKA(self.dim, kernel_size=1)
+        self.LKA2 = LKA(self.dim, kernel_size=3)
+        self.LKA3 = LKA(self.dim, kernel_size=5)
+        self.LKA4 = LKA(self.dim, kernel_size=7)
+
+        self.conv1 = nn.Conv2d(self.dim, self.dim, 3, 1, 1)
+        self.conv2 = nn.Conv2d(self.dim, self.dim, 3, 1, 1)
+        self.conv3 = nn.Conv2d(self.dim, self.dim, 3, 1, 1)
+        self.conv4 = nn.Conv2d(self.dim, self.dim, 3, 1, 1)
+
+        self.norm1 = nn.GroupNorm(1, self.dim)
+        self.norm2 = nn.GroupNorm(1, self.dim)
+        self.norm3 = nn.GroupNorm(1, self.dim)
+        self.norm4 = nn.GroupNorm(1, self.dim)
+
+        self.att = CLA(dim)
+
+    def forward(self, x):
+        skip = x.clone()
+        x1, x2, x3, x4 = torch.chunk(x, 4, dim=1)
+        x1 = self.LKA1(x1) + x1
+        x1 = self.norm1(x1)
+        x2 = x2 + self.conv1(x1)
+        x2 = self.LKA2(x2) + x2
+        x2 = self.norm2(x2)
+        x3 = x3 + self.conv2(x2)
+        x3 = self.LKA3(x3) + x3
+        x3 = self.norm3(x3)
+        x4 = x4 + self.conv3(x3)
+        x4 = self.LKA4(x4) + x4
+        x4 = self.norm4(x4)
+        x = torch.cat([x1, x2, x3, x4], dim=1)
+        x = x + skip
+        x = self.att(x)
+        return x
+
+
+class FeatureExtraction(nn.Module):
+    def __init__(self, in_channels, out_channels, depth=2):
+        super().__init__()
+        self.down = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.MSE = nn.Sequential(
+            *[MultiScaleExtractor(out_channels) for _ in range(depth)]
+        )
+
+    def forward(self, x):
+        x = self.down(x)
+        x = self.MSE(x)
+        return x
